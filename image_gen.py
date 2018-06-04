@@ -4,7 +4,7 @@ import cv2
 import pickle
 import glob
 import matplotlib.pyplot as plt
-# from tracker import tracker
+from lane import LaneLinesTracker
 
 # Read in the saved objpoints and imgpoint
 TEST_IMG_DIR = 'test_images'
@@ -28,12 +28,14 @@ def unwarp(img):
                   (1130,720), 
                   (190,720)])
     dst = np.float32([(200,0),
-                  (w-200,00),
+                  (w-200,0),
                   (w-200,h),
                   (200,h)])
     
     M = cv2.getPerspectiveTransform(src, dst)
-    return cv2.warpPerspective(img, M, (w, h), flags=cv2.INTER_LINEAR)
+    Minv = cv2.getPerspectiveTransform(dst, src)
+    warped = cv2.warpPerspective(img, M, (w, h), flags=cv2.INTER_LINEAR)
+    return warped, Minv, M
 
 def binary_mask(scaled, thresh = (0, 255)):
     # Create mask of 1's where the scaled gradient magnitude thresholds are met
@@ -93,127 +95,137 @@ def dir_thresh(img, sobel_kernel = 7, thresh = (0, np.pi/2)):
     return binary_mask(grad_dir, thresh)
 
 ###### HLS
-def hls_select(img, thresh = (200, 255)):
-    hls = cv2.cvtColor(img, cv2.COLOR_RGB2HLS)[:, :, 2]
-    s_binary = np.zeros_like(hls)
-    s_binary[(hls >= thresh[0]) & (hls < thresh[1])] = 1
-    return s_binary
+def hls_select(img):
+    return cv2.cvtColor(img, cv2.COLOR_RGB2HLS)[:, :, 2]
+
+def color_thresh(img, sthresh = (100, 255), vthresh = (50, 255)):
+    # Process the hls color
+    hls = cv2.cvtColor(img, cv2.COLOR_RGB2HLS)
+    s_channel = hls[:, :, 2]
+    s_binary = binary_mask(s_channel, thresh = sthresh)
+
+    # Process the hsv color
+    hsv = cv2.cvtColor(img, cv2.COLOR_RGB2HSV)
+    v_channel = hsv[:, :, 2]
+    v_binary = binary_mask(v_channel, thresh = vthresh)
+
+    # Combine the two thresholds
+    output = np.zeros_like(s_channel)
+    output[(s_binary == 1) & (v_channel == 1)] = 1
+
+    return output
     
 def combine_gradient(img):
     # Sobel Absolute
-    sobelX = abs_sobel_thresh(img, orient = 'x', thresh = (10, 160))
-    sobelY = abs_sobel_thresh(img, orient = 'y', thresh = (10, 160))
+    sobelX = abs_sobel_thresh(img, orient = 'x', thresh = (12, 255))
+    sobelY = abs_sobel_thresh(img, orient = 'y', thresh = (25, 255))
 
-    # HLS S-Channel binaries
-    color_binary = hls_select(img)
+    # Color threshold
+    color_binary = color_thresh(img, sthresh = (100, 255), vthresh = (50, 255))
 
     # Combine the sobel binaries and HLS color binaries
     combined_binary = np.zeros_like(sobelX) 
-    combined_binary[((sobelX == 1) & (sobelY == 1)) | (color_binary == 1)] = 1
+    combined_binary[((sobelX == 1) & (sobelY == 1) | (color_binary == 1))] = 1
     
     return combined_binary
-    
-def pipeline(img):   
+
+def window_mask(width, height, img_ref, center, level):
+    output = np.zeros_like(img_ref)
+    output[int(img_ref.shape[0] - (level + 1)* height):int(img_ref.shape[0] - level * height), max(0, int(center - width))]
+    return output
+
+def process_img(img):   
     # Undistort
     img_undist = undistort(img)
 
-    # Perspective Transform
-    img_unwarp = unwarp(img_undist)
+    combined_binary = combine_gradient(img_undist)
 
-    combined_binary = combine_gradient(img_unwarp)
-
-    #window_polyfit(combined_binary, visualize_polyfit = True)
-
-    return np.uint8(combined_binary * 255)
-
-def window_polyfit(binary_warped, visualize_polyfit = False):
-    # Assuming you have created a warped binary image called "binary_warped"
-    # Take a histogram of the bottom half of the image
-    histogram = np.sum(binary_warped[binary_warped.shape[0]//2:,:], axis=0)
-    # Create an output image to draw on and  visualize the result
-    out_img = np.dstack((binary_warped, binary_warped, binary_warped))*255
-    # Find the peak of the left and right halves of the histogram
-    # These will be the starting point for the left and right lines
-    midpoint = np.int(histogram.shape[0]//2)
-    leftx_base = np.argmax(histogram[:midpoint])
-    rightx_base = np.argmax(histogram[midpoint:]) + midpoint
-
-    # Choose the number of sliding windows
-    nwindows = 9
-    # Set height of windows
-    window_height = np.int(binary_warped.shape[0]//nwindows)
-    # Identify the x and y positions of all nonzero pixels in the image
-    nonzero = binary_warped.nonzero()
-    nonzeroy = np.array(nonzero[0])
-    nonzerox = np.array(nonzero[1])
-    # Current positions to be updated for each window
-    leftx_current = leftx_base
-    rightx_current = rightx_base
-    # Set the width of the windows +/- margin
-    margin = 100
-    # Set minimum number of pixels found to recenter window
-    minpix = 50
-    # Create empty lists to receive left and right lane pixel indices
-    left_lane_inds = []
-    right_lane_inds = []
-
-    # Step through the windows one by one
-    for window in range(nwindows):
-        # Identify window boundaries in x and y (and right and left)
-        win_y_low = binary_warped.shape[0] - (window+1)*window_height
-        win_y_high = binary_warped.shape[0] - window*window_height
-        win_xleft_low = leftx_current - margin
-        win_xleft_high = leftx_current + margin
-        win_xright_low = rightx_current - margin
-        win_xright_high = rightx_current + margin
-        # Draw the windows on the visualization image
-        cv2.rectangle(out_img,(win_xleft_low,win_y_low),(win_xleft_high,win_y_high),
-                      (0,255,0), 2) 
-        cv2.rectangle(out_img,(win_xright_low,win_y_low),(win_xright_high,win_y_high),
-                      (0,255,0), 2) 
-        # Identify the nonzero pixels in x and y within the window
-        good_left_inds = ((nonzeroy >= win_y_low) & (nonzeroy < win_y_high) & 
-                          (nonzerox >= win_xleft_low) &  (nonzerox < win_xleft_high)).nonzero()[0]
-        good_right_inds = ((nonzeroy >= win_y_low) & (nonzeroy < win_y_high) & 
-                           (nonzerox >= win_xright_low) &  (nonzerox < win_xright_high)).nonzero()[0]
-        # Append these indices to the lists
-        left_lane_inds.append(good_left_inds)
-        right_lane_inds.append(good_right_inds)
-        # If you found > minpix pixels, recenter next window on their mean position
-        if len(good_left_inds) > minpix:
-            leftx_current = np.int(np.mean(nonzerox[good_left_inds]))
-        if len(good_right_inds) > minpix:        
-            rightx_current = np.int(np.mean(nonzerox[good_right_inds]))
-
-    # Concatenate the arrays of indices
-    left_lane_inds = np.concatenate(left_lane_inds)
-    right_lane_inds = np.concatenate(right_lane_inds)
+    img_unwarp, Minv, M = unwarp(combined_binary)
+    img_unwarp = np.uint8(img_unwarp * 255)
     
-    # Extract left and right line pixel positions
-    leftx = nonzerox[left_lane_inds]
-    lefty = nonzeroy[left_lane_inds] 
-    rightx = nonzerox[right_lane_inds]
-    righty = nonzeroy[right_lane_inds] 
+    curve_centers = LaneLinesTracker(window_height = 80, window_width = 25, margin = 25, my_ym = 10 / 720, my_xm = 4 / 384)
+
+    window_centroids = curve_centers.find_window_centroids(img_unwarp)
+
+    return draw_center_windows(img_unwarp, img, window_centroids, curve_centers, Minv)
+    
+    
+def draw_center_windows(warped, orig_img, window_centroids, curve_centers, Minv):
+    # image size
+    h, w = orig_img.shape[:2]
+    # set width and height
+    window_width = curve_centers.window_width
+    window_height = curve_centers.window_height
+    
+    # points to draw left and right windows
+    r_points = np.zeros_like(warped)
+    l_points = np.zeros_like(warped)
+
+    # points to find left and right lanes
+    rightx = []
+    leftx = []
+
+    # Go through each level and draw windows
+    for level in range(0, len(window_centroids)):
+        # window mask to draw window areas
+        l_mask = window_mask(window_width, window_height, warped, window_centroids[level][0], level)
+        r_mask = window_mask(window_width, window_height, warped, window_centroids[level][1], level)
         
-    # Fit a second order polynomial to each
-    left_fit = np.polyfit(lefty, leftx, 2)
-    right_fit = np.polyfit(righty, rightx, 2)
+        # Add center values found
+        leftx.append(window_centroids[level][0])
+        rightx.append(window_centroids[level][1])
+        
+        # Add graphic points from window mask to total pixels found
+        l_points[(l_points == 255) | ((l_mask == 255))] = 255
+        r_points[(r_points == 255) | ((r_mask == 255))] = 255
+        
+    # Fit lane boundaries to the (left, right) center position found
+    yvals = range(0, warped.shape[0])
 
-    if visualize_polyfit:
-        ploty = np.linspace(0, binary_warped.shape[0]-1, binary_warped.shape[0] )
-        left_fitx = left_fit[0]*ploty**2 + left_fit[1]*ploty + left_fit[2]
-        right_fitx = right_fit[0]*ploty**2 + right_fit[1]*ploty + right_fit[2]
+    res_yvals = np.arange(warped.shape[0] - (window_height / 2), 0, -window_height)
 
-        out_img[nonzeroy[left_lane_inds], nonzerox[left_lane_inds]] = [255, 0, 0]
-        out_img[nonzeroy[right_lane_inds], nonzerox[right_lane_inds]] = [0, 0, 255]
-        plt.imshow(out_img)
-        plt.plot(left_fitx, ploty, color='yellow')
-        plt.plot(right_fitx, ploty, color='yellow')
-        plt.xlim(0, 1280)
-        plt.ylim(720, 0)
-        plt.show()
+    left_fit = np.polyfit(res_yvals, leftx, 2)
+    left_fitx = np.array(left_fit[0] * yvals * yvals + left_fit[1] * yvals + left_fit[2], np.int32)
 
+    right_fit = np.polyfit(res_yvals, rightx, 2)
+    right_fitx = np.array(right_fit[0] * yvals * yvals + right_fit[1] * yvals + right_fit[2], np.int32)
 
+    left_lane = np.array(list(zip(np.concatenate((left_fitx - window_width / 2, left_fitx[::-1] + window_width / 2), axis = 0), np.concatenate((yvals, yvals[::-1]), axis = 0))), np.int32)
+    right_lane = np.array(list(zip(np.concatenate((right_fitx - window_width / 2, right_fitx[::-1] + window_width / 2), axis = 0), np.concatenate((yvals, yvals[::-1]), axis = 0))), np.int32)
+    inner_lane = np.array(list(zip(np.concatenate((left_fitx + window_width / 2, right_fitx[::-1] - window_width / 2), axis = 0), np.concatenate((yvals, yvals[::-1]), axis = 0))), np.int32)
+
+    road = np.zeros_like(orig_img)
+    road_bkg = np.zeros_like(orig_img)
+    cv2.fillPoly(road, [left_lane], color = [255, 0, 0])
+    cv2.fillPoly(road, [right_lane], color = [0, 0, 255])
+    cv2.fillPoly(road, [inner_lane], color = [0, 255, 0])
+    cv2.fillPoly(road_bkg, [left_lane], color = [255, 255, 255])
+    cv2.fillPoly(road_bkg, [right_lane], color = [255, 255, 255])
+
+    road_warped = cv2.warpPerspective(road, Minv, (w, h), flags = cv2.INTER_LINEAR)
+    road_warped_bkg = cv2.warpPerspective(road_bkg, Minv, (w, h), flags = cv2.INTER_LINEAR)
+
+    base = cv2.addWeighted(orig_img, 1.0, road_warped_bkg, -1.0, 0.0)
+    img_with_lines = cv2.addWeighted(base, 1.0, road_warped, 0.7, 0.0)
+
+    ym_per_pix = curve_centers.ym_per_pix
+    xm_per_pix = curve_centers.xm_per_pix
+
+    curve_fit_cr = np.polyfit(np.array(res_yvals, np.float32) * ym_per_pix, np.array(leftx, np.float32) * xm_per_pix, 2)
+    curvered = ((1 + (2 * curve_fit_cr[0] * yvals[-1] * ym_per_pix + curve_fit_cr[1])**2)**1.5) / np.absolute(2 * curve_fit_cr[0])
+    
+    # calculate the offset of the car on the road
+    camera_center = (left_fitx[-1] + right_fitx[-1]) / 2
+    center_diff = (camera_center - warped.shape[1]/2) * xm_per_pix
+    side_pos = 'left'
+    if center_diff <= 0:
+        side_pos = 'right'
+
+    cv2.putText(img_with_lines, 'Radius of curvature = {} (m)'.format(str(round(curvered, 3))), (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+    cv2.putText(img_with_lines, 'Vehicle is {} m {} of center'.format(str(abs(round(center_diff, 3))), side_pos), (50, 100), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+
+    return img_with_lines
+        
 def main():
     # pipeline to detect lane
     # Make a list of test images
@@ -222,7 +234,7 @@ def main():
     # Step through the list and search for chessboard corners
     for idx, fname in enumerate(images):
         img = cv2.imread(fname)
-        img_distorted = pipeline(img)
+        img_distorted = process_img(img)
         cv2.imwrite(osp.join(OUTPUT_IMG_DIR, 'combined_test_{}.jpg'.format(idx)), img_distorted)
 
 if __name__ == '__main__':
